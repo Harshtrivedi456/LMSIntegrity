@@ -2,8 +2,8 @@ from flask import Flask, render_template, redirect, url_for, request, flash
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_bcrypt import Bcrypt
 from models import db, User, Course, Submission, Assignment
-import logic
-import datetime # Using the module import to be safe across all class calls
+import logic  # Importing your FAISS version
+import datetime
 import os
 
 app = Flask(__name__)
@@ -24,7 +24,18 @@ login_manager.login_view = 'login'
 def load_user(id): 
     return db.session.get(User, int(id))
 
-# --- AUTH ROUTES ---
+# --- HELPER: INITIALIZE FAISS ON STARTUP ---
+def sync_vector_engine():
+    """Loads all existing text from DB into the FAISS index."""
+    with app.app_context():
+        # Get all submissions that have extracted text
+        all_subs = Submission.query.all()
+        texts = [s.text_content for s in all_subs if s.text_content]
+        if texts:
+            logic.build_index(texts)
+            print(f"FAISS Index synchronized with {len(texts)} documents.")
+
+# --- AUTH ROUTES (Unchanged) ---
 
 @app.route('/')
 def index():
@@ -71,7 +82,6 @@ def dashboard():
         courses = Course.query.filter_by(faculty_id=current_user.id).all()
         return render_template('dashboard.html', courses=courses)
     else:
-        # Enrolled courses is a list/query based on your User model relationship
         enrolled_courses = current_user.enrolled_courses 
         all_available = Course.query.all()
         return render_template('dashboard.html', 
@@ -123,7 +133,6 @@ def create_assignment(course_id):
         deadline_str = request.form.get('deadline')
         
         try:
-            # Using datetime.datetime.strptime to avoid module vs class conflict
             deadline = datetime.datetime.strptime(deadline_str, '%Y-%m-%dT%H:%M')
         except ValueError:
             flash("Invalid date format.", "danger")
@@ -168,36 +177,7 @@ def course_page(course_id):
                            now=datetime.datetime.now(),
                            Submission=Submission)
 
-@app.route('/edit_assignment/<int:assignment_id>', methods=['GET', 'POST'])
-@login_required
-def edit_assignment(assignment_id):
-    if current_user.role != 'faculty':
-        return redirect(url_for('dashboard'))
-
-    assignment = db.get_or_404(Assignment, assignment_id)
-    
-    if request.method == 'POST':
-        assignment.title = request.form.get('title')
-        assignment.instructions = request.form.get('instructions')
-        assignment.attempt_limit = request.form.get('attempt_limit')
-        # Convert string deadline to datetime object
-        deadline_str = request.form.get('deadline')
-        assignment.deadline = datetime.datetime.strptime(deadline_str, '%Y-%m-%dT%H:%M')
-        
-        db.session.commit()
-        flash("Assignment updated successfully!", "success")
-        return redirect(url_for('course_page', course_id=assignment.course_id))
-
-    return render_template('course_page.html', course=Course, assignments=Assignment, Submission=Submission, now=datetime.datetime.now())  
-    
-import hashlib
-
-def calculate_hash(file_path):
-    hasher = hashlib.sha256()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+# --- THE UPDATED SUBMISSION ROUTE ---
 
 @app.route('/submit/<int:assignment_id>', methods=['GET', 'POST'])
 @login_required
@@ -205,7 +185,6 @@ def submit(assignment_id):
     assignment = db.get_or_404(Assignment, assignment_id)
     attempts_made = Submission.query.filter_by(user_id=current_user.id, assignment_id=assignment_id).count()
 
-    # 1. Check if user has attempts left
     if attempts_made >= assignment.attempt_limit:
         flash(f"No attempts remaining. (Limit: {assignment.attempt_limit})", "danger")
         return redirect(url_for('course_page', course_id=assignment.course_id))
@@ -217,52 +196,77 @@ def submit(assignment_id):
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
             
-            # 2. Run Plagiarism Check
-            new_hash = calculate_hash(file_path)
-            score,reason = logic.run_plagiarism_check(
-                file_path, 
-                new_hash, 
-                assignment.course_id, 
-                current_user.id, 
-                Submission
-            )
+            # 1. Extract Text and Hash using advanced Logic
+            # Note: logic.extract_text handles OCR and PDF automatically now
+            extracted_text, binary_content, file_hash = logic.extract_text(file_path)
             
-            # 3. Decision Logic: High similarity = REJECTED
-            # Usually, > 0.3 (30%) is a standard threshold, or 1.0 for exact matches
-            if score > 0.3: 
-                final_status = 'rejected'
-                flash_msg = f"ALERT: High Similarity Detected ({int(score*100)}%). Submission REJECTED."
-                flash_category = "danger"
+            if not extracted_text or len(extracted_text) < 10:
+                flash("Could not read file. Ensure it is not an empty or blurry image.", "warning")
+                return redirect(request.url)
 
-            elif"scan" in reason.lower():
-                final_status = 'rejected'
-                flash_msg = f"REJECTED: {reason}"
-                category = "warning"
+            # 2. Check for EXACT duplicate hash (Fastest)
+            existing_duplicate = Submission.query.filter_by(
+                content_hash=file_hash, 
+                course_id=assignment.course_id
+            ).filter(Submission.user_id != current_user.id).first()
 
+            max_score = 0.0
+            reason = "Original Work"
+
+            if existing_duplicate:
+                max_score = 1.0
+                reason = f"Exact duplicate of {existing_duplicate.author.username}'s file"
             else:
-                final_status = 'accepted'
-                flash_msg = f"Submission Successful! Similarity Score: {int(score*100)}%."
-                flash_category = "success"
+                # 3. Vector Similarity Check (Handwritten vs computerized vs other students)
+                # Fetch all other students' texts in this course
+                others = Submission.query.filter(
+                    Submission.course_id == assignment.course_id,
+                    Submission.user_id != current_user.id
+                ).all()
 
-            # 4. Save to Database (Count increases because we commit a record)
+                for other in others:
+                    if other.text_content:
+                        sim_score = logic.hybrid_similarity(extracted_text, other.text_content)
+                        if sim_score > max_score:
+                            max_score = sim_score
+                            reason = f"High similarity with {other.author.username}"
+
+            # 4. Final Decision Logic
+            final_status = 'accepted'
+            flash_category = "success"
+            
+            if max_score > 0.4:  # 40% threshold for AI similarity
+                final_status = 'rejected'
+                flash_category = "danger"
+                flash_msg = f"Submission REJECTED: {reason} ({int(max_score*100)}%)"
+            else:
+                flash_msg = f"Submission Successful! Similarity Score: {int(max_score*100)}%."
+
+            # 5. Save to Database (including the cleaned text for future indexing)
             new_sub = Submission(
                 assignment_id=assignment_id,
                 user_id=current_user.id,
                 course_id=assignment.course_id,
                 filename=filename,
-                content_hash=new_hash,
-                score=score,
+                text_content=extracted_text, # Save text for next comparisons
+                content_hash=file_hash,
+                score=max_score,
                 status=final_status,
-                reason=reason, # # This is 'rejected' or 'accepted'
+                reason=reason,
                 timestamp=datetime.datetime.now()
             )
             db.session.add(new_sub)
             db.session.commit()
             
+            # 6. REBUILD FAISS INDEX with the new text
+            sync_vector_engine()
+            
             flash(flash_msg, flash_category)
             return redirect(url_for('course_page', course_id=assignment.course_id))
 
     return render_template('upload.html', assignment=assignment, attempts_made=attempts_made)
+
+# --- REPORTS & PUBLISHING ---
 
 @app.route('/course/<int:course_id>/reports')
 @login_required
@@ -291,4 +295,6 @@ def toggle_publish(assignment_id):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        # Pre-load the FAISS index so it's ready for the first request
+        sync_vector_engine()
     app.run(debug=True)
